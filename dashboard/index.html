@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Token Radar &mdash; pre-token protocols ranked by implied launch value</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<a class="skip" href="#board">Skip to the board</a>
+<header class="topbar">
+  <div class="wrap">
+    <div class="brand">
+      <span class="pulse" aria-hidden="true"></span>
+      <div>
+        <h1>Token Radar</h1>
+        <p class="tag">Pre-token protocols, ranked by what their launch would be worth.</p>
+      </div>
+    </div>
+    <div class="meta">
+      <span class="pill" id="meta-asof">snapshot</span>
+      <span class="pill" id="meta-model">model</span>
+      <span class="pill" id="meta-count">rows</span>
+    </div>
+  </div>
+</header>
+<nav class="tabs" role="tablist" aria-label="Views">
+  <div class="wrap">
+    <button class="tab is-on" id="tab-board" role="tab" aria-selected="true" type="button">Launch board</button>
+    <button class="tab" id="tab-live" role="tab" aria-selected="false" type="button">Live tokens</button>
+    <button class="tab" id="tab-method" role="tab" aria-selected="false" type="button">How it works</button>
+  </div>
+</nav>
+<section class="stats wrap" id="stats" aria-label="Board summary"></section>
+<section class="toolbar wrap" id="toolbar" aria-label="Filters"></section>
+<main id="view" class="wrap" tabindex="-1"></main>
+<footer class="wrap foot">
+  <p id="foot-note"></p>
+</footer>
+<script src="../data.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
