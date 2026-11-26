@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Token Radar &middot; Pre-Token Launch Valuation Board</title>
+  <title>Token Radar &middot; Empirical Pre-Token Valuation Board</title>
   <link rel="stylesheet" href="app.css">
 </head>
 <body>
@@ -15,13 +15,13 @@
         <span class="beacon" aria-hidden="true"></span>
         <div>
           <h1>Token Radar</h1>
-          <p class="subtitle">Pre-token DeFi protocols ranked by implied launch valuation &amp; actionable farm plans</p>
+          <p class="subtitle">Empirical peer-calibrated pre-token valuations &amp; chain-aware farm plans</p>
         </div>
       </div>
       <div class="header-badges" id="header-badges">
         <span class="badge-pill" id="badge-date">snapshot</span>
         <span class="badge-pill" id="badge-model">model</span>
-        <span class="badge-pill" id="badge-rows">rows</span>
+        <span class="badge-pill" id="badge-fit">fit</span>
       </div>
     </div>
   </header>
@@ -30,17 +30,19 @@
     <div class="container nav-row">
       <button class="nav-btn active" id="nav-board" role="tab" aria-selected="true" type="button">Launch Board</button>
       <button class="nav-btn" id="nav-live" role="tab" aria-selected="false" type="button">Live Benchmarks</button>
-      <button class="nav-btn" id="nav-method" role="tab" aria-selected="false" type="button">Methodology</button>
+      <button class="nav-btn" id="nav-method" role="tab" aria-selected="false" type="button">Methodology &amp; LOO-CV</button>
     </div>
   </nav>
 
   <section class="container kpi-grid" id="kpi-grid" aria-label="Key metrics"></section>
+  <section class="container chart-grid" id="chart-grid" aria-label="Empirical valuation charts"></section>
   <section class="container filter-bar" id="filter-bar" aria-label="Search and filter controls"></section>
   <main class="container" id="main-stage" tabindex="-1"></main>
 
   <footer class="container site-footer">
     <p id="footer-disclaimer"></p>
   </footer>
+  <svg id="svg-ns" style="display:none" aria-hidden="true"></svg>
 
   <script src="../data.js"></script>
   <script src="app.js"></script>

@@ -1,6 +1,9 @@
-// Deterministic pre-token protocol scoring engine (radar-2) for Token Radar.
-// Computes implied launch valuation strictly from sealed snapshot metrics:
-// TVL base multiple (0.22), asymmetric 7-day momentum multiplier, and age maturity curve.
+// Empirical peer-calibrated pre-token valuation model (`peer-curve-v2`).
+//
+// Fits an IRLS Huber log-linear size curve ln(mcap) = alpha + beta * ln(tvl) across all live-token
+// protocols in snapshot.json, applies Empirical-Bayes category residual shrinkage, adjusts for
+// 7-day TVL momentum, track-record maturity, and multi-chain breadth, and validates out-of-sample
+// accuracy via Leave-One-Out Cross-Validation (LOO-CV) against a naive 0.22x TVL baseline.
 
 export interface ProtocolSnapshotEntry {
   slug: string;
@@ -23,9 +26,12 @@ export interface Snapshot {
   watchlist: string[];
 }
 
-export interface RadarModelConfig {
+export interface PeerCurveParams {
   version: string;
-  base_tvl_multiple: number;
+  alpha: number;
+  beta: number;
+  shrinkage_k: number;
+  cat_adj_cap: number;
   momentum_pos_weight: number;
   momentum_neg_weight: number;
   momentum_min_pct: number;
@@ -34,23 +40,42 @@ export interface RadarModelConfig {
   maturity_span: number;
   maturity_horizon_days: number;
   fallback_age_days: number;
+  chain_step: number;
+  max_extra_chains: number;
+  baseline_multiple: number;
 }
 
-export const RADAR2_CONFIG: RadarModelConfig = {
-  version: 'radar-2',
-  base_tvl_multiple: 0.22,
-  momentum_pos_weight: 0.5,
-  momentum_neg_weight: 0.9,
+export const MODEL_DEFAULTS = {
+  version: 'peer-curve-v2',
+  shrinkage_k: 4,
+  cat_adj_cap: 1.0,
+  momentum_pos_weight: 0.35,
+  momentum_neg_weight: 0.65,
   momentum_min_pct: -60,
   momentum_max_pct: 120,
-  maturity_base: 0.55,
-  maturity_span: 0.45,
+  maturity_base: 0.7,
+  maturity_span: 0.3,
   maturity_horizon_days: 1095,
   fallback_age_days: 365,
-};
+  chain_step: 0.04,
+  max_extra_chains: 4,
+  baseline_multiple: 0.22,
+} as const;
 
-export const MAX_EARLY_PROTOCOLS = 160;
-export const MAX_LIVE_PROTOCOLS = 24;
+export interface CategoryCalibration {
+  peers: number;
+  median_ratio: number;
+  log_adjustment: number;
+}
+
+export interface ValidationMetrics {
+  live_fit_count: number;
+  loo_rmsle: number;
+  loo_median_fold: number;
+  baseline_rmsle: number;
+  baseline_median_fold: number;
+  error_reduction_pct: number;
+}
 
 export interface ActionStep {
   instruction: string;
@@ -73,11 +98,16 @@ export interface BoardRow {
   token_status: 'pre-token';
   age_days: number | null;
   implied_value_usd: number;
+  est_farm_cost_usd: number;
   model: {
-    base_multiple: number;
+    version: string;
+    curve_base_usd: number;
+    category_peers: number;
+    category_multiplier: number;
     growth_pct: number;
     growth_multiplier: number;
     maturity_multiplier: number;
+    chain_multiplier: number;
     age_days: number | null;
   };
   farm_steps: string[];
@@ -95,8 +125,13 @@ export interface DashboardProtocolRow {
   age_days: number | null;
   watchlisted: boolean;
   implied_value_usd: number;
+  est_farm_cost_usd: number;
+  curve_base_usd: number;
+  category_peers: number;
+  category_multiplier: number;
   growth_multiplier: number;
   maturity_multiplier: number;
+  chain_multiplier: number;
 }
 
 export interface LiveTokenEntry {
@@ -105,8 +140,9 @@ export interface LiveTokenEntry {
   category: string | null;
   chains: string[];
   tvl_usd: number;
-  mcap_usd: number | null;
+  mcap_usd: number;
   change_7d: number | null;
+  mcap_tvl_ratio: number;
 }
 
 export interface RadarDataset {
@@ -114,7 +150,9 @@ export interface RadarDataset {
   source: string;
   floor_usd: number;
   total_universe: number;
-  config: RadarModelConfig;
+  params: PeerCurveParams;
+  category_calibration: Record<string, CategoryCalibration>;
+  validation: ValidationMetrics;
   watchlist_total: number;
   board_total: number;
   early_total: number;
@@ -134,9 +172,33 @@ export class SnapshotValidationError extends Error {
 }
 
 const MS_PER_DAY = 86_400_000;
+const MAX_EARLY_ROWS = 160;
+const MAX_LIVE_DISPLAY = 40;
 const RELEASE_SUFFIX_RE = /\s(V\d+(\.\d+)?|v\d+(\.\d+)?|\d+\.\d+)$/;
+const EXCLUDED_EARLY_CATS = new Set([
+  'Bridge',
+  'Canonical Bridge',
+  'Liquid Staking',
+  'Liquid Restaking',
+  'Restaked BTC',
+  'CEX',
+]);
+const EXCHANGE_PREFIX_RE = /^(Binance|Coinbase|Bybit|Kraken|Bitget|OKX|Bitfinex|Gemini)\b/i;
+const WRAPPED_STAKED_RE = /\b(wrapped|staked|staking)\b/i;
 
-function computeAgeInDays(asOfIso: string, listedAtIso: string | null): number | null {
+function median(values: number[]): number {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 1 ? sorted[mid]! : 0.5 * (sorted[mid - 1]! + sorted[mid]!);
+}
+
+function roundN(val: number, decimals: number): number {
+  const factor = 10 ** decimals;
+  return Math.round(val * factor) / factor;
+}
+
+function computeAgeDays(asOfIso: string, listedAtIso: string | null): number | null {
   if (!listedAtIso) return null;
   const endTs = Date.parse(`${asOfIso}T00:00:00Z`);
   const startTs = Date.parse(`${listedAtIso}T00:00:00Z`);
@@ -144,47 +206,237 @@ function computeAgeInDays(asOfIso: string, listedAtIso: string | null): number |
   return Math.max(0, Math.floor((endTs - startTs) / MS_PER_DAY));
 }
 
-export function evaluateImpliedValuation(
-  entry: ProtocolSnapshotEntry,
-  asOfIso: string,
-  cfg: RadarModelConfig = RADAR2_CONFIG,
-): {
-  impliedUsd: number;
-  clampedGrowthPct: number;
-  momentumMult: number;
-  maturityMult: number;
-  ageDays: number | null;
-} {
-  const ageDays = computeAgeInDays(asOfIso, entry.listed_at);
-  const rawPct = typeof entry.change_7d === 'number' && Number.isFinite(entry.change_7d) ? entry.change_7d : 0;
-  const clampedGrowthPct = Math.min(cfg.momentum_max_pct, Math.max(cfg.momentum_min_pct, rawPct));
-  const slope = clampedGrowthPct >= 0 ? cfg.momentum_pos_weight : cfg.momentum_neg_weight;
-  const momentumMult = 1 + (clampedGrowthPct / 100) * slope;
-  const effectiveAge = ageDays ?? cfg.fallback_age_days;
-  const boundedAge = Math.min(Math.max(effectiveAge, 0), cfg.maturity_horizon_days);
-  const maturityMult = cfg.maturity_base + (boundedAge / cfg.maturity_horizon_days) * cfg.maturity_span;
-  const baseUsd = entry.tvl_usd * cfg.base_tvl_multiple;
-  const impliedUsd = Math.max(1, Math.round(baseUsd * momentumMult * maturityMult));
-  return { impliedUsd, clampedGrowthPct, momentumMult, maturityMult, ageDays };
+interface FitPoint {
+  x: number;
+  y: number;
+  cat: string;
+  tvl: number;
+}
+
+function fitHuberLine(points: FitPoint[]): { alpha: number; beta: number } {
+  if (points.length < 2) return { alpha: 0, beta: 0.5 };
+  let alpha = 0;
+  let beta = 0.5;
+  const weights = new Array<number>(points.length).fill(1);
+
+  for (let iter = 0; iter < 15; iter++) {
+    let sumW = 0;
+    let sumX = 0;
+    let sumY = 0;
+    for (let i = 0; i < points.length; i++) {
+      const w = weights[i]!;
+      sumW += w;
+      sumX += w * points[i]!.x;
+      sumY += w * points[i]!.y;
+    }
+    const meanX = sumX / sumW;
+    const meanY = sumY / sumW;
+    let cov = 0;
+    let varX = 0;
+    for (let i = 0; i < points.length; i++) {
+      const dx = points[i]!.x - meanX;
+      cov += weights[i]! * dx * (points[i]!.y - meanY);
+      varX += weights[i]! * dx * dx;
+    }
+    beta = varX > 0 ? cov / varX : 0.5;
+    alpha = meanY - beta * meanX;
+
+    const absRes = points.map((pt) => Math.abs(pt.y - (alpha + beta * pt.x)));
+    const mad = Math.max(0.2, 1.4826 * median(absRes));
+    const cutoff = 1.345 * mad;
+    for (let i = 0; i < points.length; i++) {
+      const r = absRes[i]!;
+      weights[i] = r <= cutoff ? 1 : cutoff / r;
+    }
+  }
+  return { alpha, beta };
+}
+
+function buildCategoryCalibrations(
+  points: FitPoint[],
+  alpha: number,
+  beta: number,
+): Record<string, CategoryCalibration> {
+  const byCat = new Map<string, { residuals: number[]; ratios: number[] }>();
+  for (const pt of points) {
+    let bucket = byCat.get(pt.cat);
+    if (!bucket) {
+      bucket = { residuals: [], ratios: [] };
+      byCat.set(pt.cat, bucket);
+    }
+    bucket.residuals.push(pt.y - (alpha + beta * pt.x));
+    bucket.ratios.push(Math.exp(pt.y) / pt.tvl);
+  }
+  const out: Record<string, CategoryCalibration> = {};
+  for (const cat of [...byCat.keys()].sort()) {
+    const b = byCat.get(cat)!;
+    const n = b.residuals.length;
+    const rawMed = median(b.residuals);
+    const bounded = Math.min(MODEL_DEFAULTS.cat_adj_cap, Math.max(-MODEL_DEFAULTS.cat_adj_cap, rawMed));
+    const shrunk = (n / (n + MODEL_DEFAULTS.shrinkage_k)) * bounded;
+    out[cat] = {
+      peers: n,
+      median_ratio: roundN(median(b.ratios), 4),
+      log_adjustment: roundN(shrunk, 6),
+    };
+  }
+  return out;
+}
+
+function runLeaveOneOutValidation(points: FitPoint[]): ValidationMetrics {
+  const n = points.length;
+  if (n < 5) {
+    return {
+      live_fit_count: n,
+      loo_rmsle: 0,
+      loo_median_fold: 1,
+      baseline_rmsle: 0,
+      baseline_median_fold: 1,
+      error_reduction_pct: 0,
+    };
+  }
+
+  let sqErrModel = 0;
+  let sqErrBase = 0;
+  const absErrModel: number[] = [];
+  const absErrBase: number[] = [];
+
+  for (let i = 0; i < n; i++) {
+    const train = points.filter((_, idx) => idx !== i);
+    const fit = fitHuberLine(train);
+    const catRes = new Map<string, number[]>();
+    for (const tr of train) {
+      let arr = catRes.get(tr.cat);
+      if (!arr) {
+        arr = [];
+        catRes.set(tr.cat, arr);
+      }
+      arr.push(tr.y - (fit.alpha + fit.beta * tr.x));
+    }
+    const target = points[i]!;
+    const peers = catRes.get(target.cat) ?? [];
+    const adj =
+      peers.length > 0
+        ? (peers.length / (peers.length + MODEL_DEFAULTS.shrinkage_k)) *
+          Math.min(MODEL_DEFAULTS.cat_adj_cap, Math.max(-MODEL_DEFAULTS.cat_adj_cap, median(peers)))
+        : 0;
+    const predLog = fit.alpha + fit.beta * target.x + adj;
+    const baseLog = Math.log(Math.max(1, target.tvl * MODEL_DEFAULTS.baseline_multiple));
+    const eModel = Math.abs(target.y - predLog);
+    const eBase = Math.abs(target.y - baseLog);
+    sqErrModel += eModel * eModel;
+    sqErrBase += eBase * eBase;
+    absErrModel.push(eModel);
+    absErrBase.push(eBase);
+  }
+
+  const looRmsle = Math.sqrt(sqErrModel / n);
+  const baseRmsle = Math.sqrt(sqErrBase / n);
+  const looMedFold = Math.exp(median(absErrModel));
+  const baseMedFold = Math.exp(median(absErrBase));
+  const reduction = baseMedFold > 1 ? ((baseMedFold - looMedFold) / baseMedFold) * 100 : 0;
+
+  return {
+    live_fit_count: n,
+    loo_rmsle: roundN(looRmsle, 3),
+    loo_median_fold: roundN(looMedFold, 2),
+    baseline_rmsle: roundN(baseRmsle, 3),
+    baseline_median_fold: roundN(baseMedFold, 2),
+    error_reduction_pct: roundN(reduction, 1),
+  };
 }
 
 export function hasNoRecordedToken(entry: ProtocolSnapshotEntry): boolean {
   return entry.mcap_usd === null && entry.gecko_id === null && entry.symbol === null;
 }
 
-export function isEligibleEarlyProtocol(entry: ProtocolSnapshotEntry): boolean {
-  return hasNoRecordedToken(entry) && entry.category !== 'CEX' && !RELEASE_SUFFIX_RE.test(entry.name);
+export function isCleanEarlyCandidate(entry: ProtocolSnapshotEntry): boolean {
+  return (
+    hasNoRecordedToken(entry) &&
+    !EXCLUDED_EARLY_CATS.has(entry.category ?? '') &&
+    !EXCHANGE_PREFIX_RE.test(entry.name) &&
+    !WRAPPED_STAKED_RE.test(entry.name) &&
+    !RELEASE_SUFFIX_RE.test(entry.name)
+  );
 }
 
-function roundFour(val: number): number {
-  return Math.round(val * 10_000) / 10_000;
+export function evaluateImpliedValuation(
+  entry: ProtocolSnapshotEntry,
+  asOfIso: string,
+  params: PeerCurveParams,
+  calibrations: Record<string, CategoryCalibration>,
+): {
+  impliedUsd: number;
+  curveBaseUsd: number;
+  catPeers: number;
+  catMult: number;
+  growthPct: number;
+  growthMult: number;
+  maturityMult: number;
+  chainMult: number;
+  ageDays: number | null;
+} {
+  const ageDays = computeAgeDays(asOfIso, entry.listed_at);
+  const catKey = entry.category ?? 'Uncategorized';
+  const cal = calibrations[catKey];
+  const catPeers = cal ? cal.peers : 0;
+  const logAdj = cal ? cal.log_adjustment : 0;
+  const catMult = Math.exp(logAdj);
+
+  const curveBaseUsd = Math.exp(params.alpha + params.beta * Math.log(Math.max(1, entry.tvl_usd)));
+
+  const rawGrowth = typeof entry.change_7d === 'number' && Number.isFinite(entry.change_7d) ? entry.change_7d : 0;
+  const growthPct = Math.min(params.momentum_max_pct, Math.max(params.momentum_min_pct, rawGrowth));
+  const slope = growthPct >= 0 ? params.momentum_pos_weight : params.momentum_neg_weight;
+  const growthMult = 1 + (growthPct / 100) * slope;
+
+  const effectiveAge = ageDays ?? params.fallback_age_days;
+  const boundedAge = Math.min(Math.max(effectiveAge, 0), params.maturity_horizon_days);
+  const maturityMult = params.maturity_base + (boundedAge / params.maturity_horizon_days) * params.maturity_span;
+
+  const extraChains = Math.min(params.max_extra_chains, Math.max(0, entry.chains.length - 1));
+  const chainMult = 1 + extraChains * params.chain_step;
+
+  const impliedUsd = Math.max(1, Math.round(curveBaseUsd * catMult * growthMult * maturityMult * chainMult));
+  return {
+    impliedUsd,
+    curveBaseUsd,
+    catPeers,
+    catMult,
+    growthPct,
+    growthMult,
+    maturityMult,
+    chainMult,
+    ageDays,
+  };
 }
 
-function orderBySlug(left: ProtocolSnapshotEntry, right: ProtocolSnapshotEntry): number {
-  return left.slug < right.slug ? -1 : left.slug > right.slug ? 1 : 0;
+interface ChainGasProfile {
+  txUsd: number;
+  label: string;
 }
 
-function determineCommitUsd(tvlUsd: number): number {
+function chainGasProfile(chain: string): ChainGasProfile {
+  const c = chain.toLowerCase();
+  if (c === 'ethereum') return { txUsd: 6, label: 'Ethereum L1' };
+  if (c.includes('solana') || c.includes('sui') || c.includes('aptos') || c.includes('ton')) {
+    return { txUsd: 0.25, label: chain };
+  }
+  if (
+    c.includes('arbitrum') ||
+    c.includes('base') ||
+    c.includes('optimism') ||
+    c.includes('scroll') ||
+    c.includes('zksync') ||
+    c.includes('linea') ||
+    c.includes('starknet')
+  ) {
+    return { txUsd: 0.6, label: chain };
+  }
+  return { txUsd: 1.2, label: chain };
+}
+
+function commitCapitalUsd(tvlUsd: number): number {
   if (tvlUsd >= 1_000_000_000) return 250;
   if (tvlUsd >= 250_000_000) return 150;
   if (tvlUsd >= 50_000_000) return 100;
@@ -192,7 +444,7 @@ function determineCommitUsd(tvlUsd: number): number {
   return 50;
 }
 
-function determineHoldWindow(ageDays: number | null): number {
+function holdDaysForAge(ageDays: number | null): number {
   if (ageDays === null) return 45;
   if (ageDays < 90) return 90;
   if (ageDays < 180) return 60;
@@ -200,165 +452,204 @@ function determineHoldWindow(ageDays: number | null): number {
   return 30;
 }
 
-function primaryChainName(entry: ProtocolSnapshotEntry): string {
-  return entry.chains.length > 0 ? entry.chains[0]! : 'its primary network';
-}
-
-function categoryCoreAction(entry: ProtocolSnapshotEntry, commitUsd: number, chain: string): string {
+function categoryActionCopy(entry: ProtocolSnapshotEntry, capitalUsd: number, chain: string): string {
   const cat = (entry.category ?? '').toLowerCase();
-  const label = entry.name;
+  const nm = entry.name;
   if (cat.includes('lend') || cat.includes('cdp') || cat.includes('collateral') || cat.includes('money market') || cat.includes('rist')) {
-    return `Deposit $${commitUsd} USDC as collateral in ${label} on ${chain}, draw a minimal borrow position, and keep healthy collateralization.`;
+    return `Supply $${capitalUsd} USDC as collateral in ${nm} on ${chain}, borrow 20-30% in a correlated stable asset, and maintain safe health factor.`;
   }
   if (cat.includes('dex') || cat.includes('yield') || cat.includes('leveraged farm') || cat.includes('amm')) {
-    return `Add $${commitUsd} across a balanced stable liquidity pool on ${label} (${chain}) and retain the LP position receipt.`;
+    return `Deploy $${capitalUsd} into ${nm}'s deepest stable/blue-chip pool on ${chain} and keep the LP receipt un-withdrawn for the full epoch.`;
   }
   if (cat.includes('bridge')) {
-    return `Transfer $${commitUsd} USDC into ${chain} via ${label}, keep capital active on the destination chain, and bridge back after the window.`;
+    return `Route $${capitalUsd} USDC to ${chain} through ${nm}, perform one destination swap, and leave liquidity active until the end of the window.`;
   }
-  if (cat.includes('staking') || cat.includes('restak') || cat.includes('liquid staking')) {
-    return `Stake $${commitUsd} of native gas or LST collateral through ${label} on ${chain} and retain the staked token in the same wallet.`;
+  if (cat.includes('staking') || cat.includes('restak')) {
+    return `Stake $${capitalUsd} of the native/LST asset via ${nm} on ${chain} and keep the liquid receipt token in the same burner wallet.`;
   }
   if (cat.includes('perpetual') || cat.includes('derivative') || cat.includes('leverage')) {
-    return `Post $${commitUsd} USDC margin on ${label} (${chain}), open one low-leverage position, and maintain active open interest.`;
+    return `Deposit $${capitalUsd} USDC margin on ${nm} (${chain}), execute low-leverage delta-neutral or hedged trades to build verified volume.`;
   }
   if (cat.includes('prediction') || cat.includes('betting') || cat.includes('market')) {
-    return `Allocate $${commitUsd} USDC to ${label} on ${chain} and take one measured market position with a defined settlement date.`;
+    return `Fund $${capitalUsd} USDC into ${nm} on ${chain} and place staggered positions across resolved weekly markets to log steady participation.`;
   }
-  if (cat.includes('curat') || cat.includes('allocat') || cat.includes('vault') || cat.includes('restaked')) {
-    return `Allocate $${commitUsd} in USDC or ETH-pegged assets into a curated ${label} vault on ${chain} and keep vault shares staked.`;
-  }
-  if (cat.includes('stable')) {
-    return `Mint or supply $${commitUsd} of ${label}'s stable asset on ${chain} and route it into the protocol's native savings module.`;
+  if (cat.includes('curat') || cat.includes('allocat') || cat.includes('vault')) {
+    return `Deposit $${capitalUsd} USDC or WETH into a curated ${nm} vault on ${chain} and stake vault shares in any active points gauge.`;
   }
   if (cat.includes('rwa') || cat.includes('tokenized')) {
-    return `Subscribe $${commitUsd} into ${label}'s tokenized yield instrument on ${chain} and hold the receipt continuously.`;
+    return `Subscribe $${capitalUsd} into ${nm}'s tokenized treasury or yield vault on ${chain} and hold the receipt continuously.`;
   }
-  if (cat.includes('insurance') || cat.includes('risk')) {
-    return `Purchase $${commitUsd} of protocol coverage through ${label} on ${chain} and maintain the policy through maturity.`;
-  }
-  return `Deploy $${commitUsd} USDC into ${label}'s core smart contract on ${chain} and record at least one qualifying interaction.`;
+  return `Deposit $${capitalUsd} USDC into ${nm}'s primary contract on ${chain} and complete one verifiable on-chain state change.`;
 }
 
-function formatStepLine(step: ActionStep): string {
+function clampStep(step: ActionStep): string {
   let line = `${step.instruction} Cost: ${step.expense}. Time: ${step.duration}.`;
   if (line.length > 600) line = `${line.slice(0, 596)}...`;
-  if (line.length < 20) line = `${line} Maintain the position and monitor official announcements.`;
+  if (line.length < 20) line = `${line} Maintain active position until official TGE snapshot.`;
   return line;
 }
 
-export function generateFarmPlan(entry: ProtocolSnapshotEntry, ageDays: number | null): ActionStep[] {
-  const chain = primaryChainName(entry);
-  const commitUsd = determineCommitUsd(entry.tvl_usd);
-  const holdDays = determineHoldWindow(ageDays);
-  const coreInstruction = categoryCoreAction(entry, commitUsd, chain);
-  const initialGas = commitUsd >= 150 ? '~$8' : '~$4';
-  const recurringGas = Math.max(8, 2 * Math.round(holdDays / 7));
+export function buildFarmPlan(
+  entry: ProtocolSnapshotEntry,
+  ageDays: number | null,
+): { steps: ActionStep[]; estGasCostUsd: number } {
+  const primaryChain = entry.chains.length > 0 ? entry.chains[0]! : 'its primary chain';
+  const gasProfile = chainGasProfile(primaryChain);
+  const capitalUsd = commitCapitalUsd(entry.tvl_usd);
+  const holdDays = holdDaysForAge(ageDays);
+  const weeks = Math.max(4, Math.round(holdDays / 7));
 
-  return [
+  const setupGas = Math.max(1, Math.round(gasProfile.txUsd * 2));
+  const weeklyGasTotal = Math.max(2, Math.round(gasProfile.txUsd * weeks));
+  const totalGasCost = setupGas + weeklyGasTotal;
+
+  const steps: ActionStep[] = [
     {
-      instruction: `Create a dedicated burner wallet isolated from main holdings, fund it with $${commitUsd} USDC plus gas on ${chain}, and back up keys offline.`,
-      expense: `$${commitUsd} principal + initial funding gas`,
+      instruction: `Isolate risk in a fresh burner wallet funded with $${capitalUsd} USDC plus gas on ${gasProfile.label}; record keys offline only.`,
+      expense: `$${capitalUsd} refundable principal + ~$${Math.max(1, Math.round(gasProfile.txUsd))} transfer gas`,
       duration: '10 minutes',
     },
     {
-      instruction: `Verify ${entry.name}'s official documentation and contract addresses on ${chain} directly before signing any approval to avoid phishing links.`,
-      expense: '$0 (verification only)',
+      instruction: `Cross-check ${entry.name}'s official docs and verified ${primaryChain} contract addresses; revoke stale allowances before interacting.`,
+      expense: '$0 (verification)',
       duration: '15 minutes',
     },
     {
-      instruction: coreInstruction,
-      expense: `$${commitUsd} committed capital + ${initialGas} gas`,
+      instruction: categoryActionCopy(entry, capitalUsd, primaryChain),
+      expense: `$${capitalUsd} deployed + ~$${setupGas} entry/approval gas on ${gasProfile.label}`,
       duration: '15 minutes',
     },
     {
-      instruction: `Execute one organic weekly transaction (rebalance, compound, borrow/repay, or governance action) so activity spans multiple epochs.`,
-      expense: `~$2/week gas (~$${recurringGas} total)`,
-      duration: `10 min/week over ${holdDays} days`,
+      instruction: `Log one organic transaction weekly (rebalance, compound, or governance vote) across ${weeks} weeks to avoid single-tx sybil filters.`,
+      expense: `~$${gasProfile.txUsd.toFixed(2)}/tx (~$${weeklyGasTotal} total over ${weeks} weeks)`,
+      duration: `10 min/week for ${holdDays} days`,
     },
     {
-      instruction: `Keep capital deployed for the entire ${holdDays}-day qualifying horizon and review ${entry.name}'s official points or epoch tracker monthly.`,
-      expense: `$${commitUsd} remains deployed (withdraw gas only at exit)`,
+      instruction: `Hold capital through the full ${holdDays}-day horizon and track official ${entry.name} epoch/points leaderboards monthly.`,
+      expense: `~$${Math.max(1, Math.round(gasProfile.txUsd))} exit gas at unwind`,
       duration: `${holdDays} days total`,
     },
     {
-      instruction: `Monitor snapshot announcements and TGE claim portals via verified channels only; never pay upfront claim fees or expose seed phrases.`,
-      expense: '$0 monitoring (gas only upon valid claim)',
-      duration: '10 minutes per milestone',
+      instruction: `Watch official channels for TGE snapshot or claim announcements; verify claim calldata before signing and reject paid-claim scams.`,
+      expense: '$0 monitoring (claim gas only at TGE)',
+      duration: '10 minutes per announcement',
     },
     {
-      instruction: `Archive wallet address, tx hashes, entry/exit timestamps, and position size in a portfolio ledger for points verification or clean unwind.`,
-      expense: '$0 (record keeping)',
+      instruction: `Maintain an audit sheet of wallet address, tx hashes, deposit dates, and capital committed for clean unwind or reward verification.`,
+      expense: '$0 (tracking)',
       duration: '5 minutes setup',
     },
   ];
+
+  return { steps, estGasCostUsd: totalGasCost };
 }
 
-export function buildBoard(snapshot: Snapshot, cfg: RadarModelConfig = RADAR2_CONFIG): BoardRow[] {
-  const bySlug = new Map(snapshot.protocols.map((p) => [p.slug, p]));
-  const selected = new Map<string, ProtocolSnapshotEntry>();
+function orderBySlug(a: ProtocolSnapshotEntry, b: ProtocolSnapshotEntry): number {
+  return a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0;
+}
 
+export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: RadarDataset } {
+  const liveProtocols = snapshot.protocols.filter(
+    (p) => p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0 && p.category !== 'CEX',
+  );
+  const fitPoints: FitPoint[] = liveProtocols.map((p) => ({
+    x: Math.log(p.tvl_usd),
+    y: Math.log(p.mcap_usd!),
+    cat: p.category ?? 'Uncategorized',
+    tvl: p.tvl_usd,
+  }));
+
+  const curve = fitHuberLine(fitPoints);
+  const params: PeerCurveParams = {
+    version: MODEL_DEFAULTS.version,
+    alpha: roundN(curve.alpha, 6),
+    beta: roundN(curve.beta, 6),
+    shrinkage_k: MODEL_DEFAULTS.shrinkage_k,
+    cat_adj_cap: MODEL_DEFAULTS.cat_adj_cap,
+    momentum_pos_weight: MODEL_DEFAULTS.momentum_pos_weight,
+    momentum_neg_weight: MODEL_DEFAULTS.momentum_neg_weight,
+    momentum_min_pct: MODEL_DEFAULTS.momentum_min_pct,
+    momentum_max_pct: MODEL_DEFAULTS.momentum_max_pct,
+    maturity_base: MODEL_DEFAULTS.maturity_base,
+    maturity_span: MODEL_DEFAULTS.maturity_span,
+    maturity_horizon_days: MODEL_DEFAULTS.maturity_horizon_days,
+    fallback_age_days: MODEL_DEFAULTS.fallback_age_days,
+    chain_step: MODEL_DEFAULTS.chain_step,
+    max_extra_chains: MODEL_DEFAULTS.max_extra_chains,
+    baseline_multiple: MODEL_DEFAULTS.baseline_multiple,
+  };
+
+  const categoryCalibration = buildCategoryCalibrations(fitPoints, params.alpha, params.beta);
+  const validation = runLeaveOneOutValidation(fitPoints);
+
+  const bySlug = new Map(snapshot.protocols.map((p) => [p.slug, p]));
+  const chosen = new Map<string, ProtocolSnapshotEntry>();
   for (const slug of snapshot.watchlist) {
-    const found = bySlug.get(slug);
-    if (found) selected.set(slug, found);
+    const p = bySlug.get(slug);
+    if (p) chosen.set(slug, p);
   }
 
-  const earlyPicks = snapshot.protocols
-    .filter((p) => !selected.has(p.slug) && isEligibleEarlyProtocol(p) && p.tvl_usd < snapshot.floor_usd)
+  const earlyCandidates = snapshot.protocols
+    .filter((p) => !chosen.has(p.slug) && isCleanEarlyCandidate(p) && p.tvl_usd < snapshot.floor_usd)
     .sort((a, b) => b.tvl_usd - a.tvl_usd || orderBySlug(a, b))
-    .slice(0, MAX_EARLY_PROTOCOLS);
+    .slice(0, MAX_EARLY_ROWS);
+  for (const p of earlyCandidates) chosen.set(p.slug, p);
 
-  for (const pick of earlyPicks) selected.set(pick.slug, pick);
+  const scored = [...chosen.values()]
+    .map((entry) => ({
+      entry,
+      ev: evaluateImpliedValuation(entry, snapshot.as_of, params, categoryCalibration),
+    }))
+    .sort((a, b) => b.ev.impliedUsd - a.ev.impliedUsd || orderBySlug(a.entry, b.entry));
 
-  const ranked = [...selected.values()]
-    .map((entry) => ({ entry, val: evaluateImpliedValuation(entry, snapshot.as_of, cfg) }))
-    .sort((a, b) => b.val.impliedUsd - a.val.impliedUsd || orderBySlug(a.entry, b.entry));
+  const board: BoardRow[] = scored.map(({ entry, ev }, idx) => {
+    const plan = buildFarmPlan(entry, ev.ageDays);
+    return {
+      rank: idx + 1,
+      slug: entry.slug,
+      name: entry.name,
+      category: entry.category,
+      chains: entry.chains,
+      tvl_usd: entry.tvl_usd,
+      change_7d: entry.change_7d,
+      mcap_usd: entry.mcap_usd,
+      listed_at: entry.listed_at,
+      gecko_id: entry.gecko_id,
+      symbol: entry.symbol,
+      token_status: 'pre-token' as const,
+      age_days: ev.ageDays,
+      implied_value_usd: ev.impliedUsd,
+      est_farm_cost_usd: plan.estGasCostUsd,
+      model: {
+        version: params.version,
+        curve_base_usd: Math.round(ev.curveBaseUsd),
+        category_peers: ev.catPeers,
+        category_multiplier: roundN(ev.catMult, 4),
+        growth_pct: ev.growthPct,
+        growth_multiplier: roundN(ev.growthMult, 4),
+        maturity_multiplier: roundN(ev.maturityMult, 4),
+        chain_multiplier: roundN(ev.chainMult, 4),
+        age_days: ev.ageDays,
+      },
+      farm_steps: plan.steps.map(clampStep),
+    };
+  });
 
-  return ranked.map(({ entry, val }, idx) => ({
-    rank: idx + 1,
-    slug: entry.slug,
-    name: entry.name,
-    category: entry.category,
-    chains: entry.chains,
-    tvl_usd: entry.tvl_usd,
-    change_7d: entry.change_7d,
-    mcap_usd: entry.mcap_usd,
-    listed_at: entry.listed_at,
-    gecko_id: entry.gecko_id,
-    symbol: entry.symbol,
-    token_status: 'pre-token' as const,
-    age_days: val.ageDays,
-    implied_value_usd: val.impliedUsd,
-    model: {
-      base_multiple: cfg.base_tvl_multiple,
-      growth_pct: val.clampedGrowthPct,
-      growth_multiplier: roundFour(val.momentumMult),
-      maturity_multiplier: roundFour(val.maturityMult),
-      age_days: val.ageDays,
-    },
-    farm_steps: generateFarmPlan(entry, val.ageDays).map(formatStepLine),
-  }));
-}
-
-export function extractLiveTokens(snapshot: Snapshot): LiveTokenEntry[] {
-  return snapshot.protocols
-    .filter((p) => !hasNoRecordedToken(p) && p.category !== 'CEX')
+  const liveRows: LiveTokenEntry[] = liveProtocols
+    .slice()
     .sort((a, b) => (b.mcap_usd ?? 0) - (a.mcap_usd ?? 0) || b.tvl_usd - a.tvl_usd)
-    .slice(0, MAX_LIVE_PROTOCOLS)
+    .slice(0, MAX_LIVE_DISPLAY)
     .map((p) => ({
       slug: p.slug,
       name: p.name,
       category: p.category,
       chains: p.chains,
       tvl_usd: p.tvl_usd,
-      mcap_usd: p.mcap_usd,
+      mcap_usd: p.mcap_usd!,
       change_7d: p.change_7d,
+      mcap_tvl_ratio: roundN(p.mcap_usd! / p.tvl_usd, 3),
     }));
-}
 
-export function buildRadar(snapshot: Snapshot, cfg: RadarModelConfig = RADAR2_CONFIG): { board: BoardRow[]; radar: RadarDataset } {
-  const board = buildBoard(snapshot, cfg);
-  const live = extractLiveTokens(snapshot);
   const watchSet = new Set(snapshot.watchlist);
   const earlyTotal = board.filter((r) => !watchSet.has(r.slug)).length;
   const categories = [...new Set(board.map((r) => r.category).filter((c): c is string => c !== null))].sort();
@@ -370,11 +661,13 @@ export function buildRadar(snapshot: Snapshot, cfg: RadarModelConfig = RADAR2_CO
     source: snapshot.source,
     floor_usd: snapshot.floor_usd,
     total_universe: snapshot.protocols.length,
-    config: cfg,
+    params,
+    category_calibration: categoryCalibration,
+    validation,
     watchlist_total: snapshot.watchlist.length,
     board_total: board.length,
     early_total: earlyTotal,
-    live_total: live.length,
+    live_total: liveRows.length,
     aggregate_implied_usd: aggregateImplied,
     categories,
     chains,
@@ -390,10 +683,15 @@ export function buildRadar(snapshot: Snapshot, cfg: RadarModelConfig = RADAR2_CO
       age_days: r.age_days,
       watchlisted: watchSet.has(r.slug),
       implied_value_usd: r.implied_value_usd,
+      est_farm_cost_usd: r.est_farm_cost_usd,
+      curve_base_usd: r.model.curve_base_usd,
+      category_peers: r.model.category_peers,
+      category_multiplier: r.model.category_multiplier,
       growth_multiplier: r.model.growth_multiplier,
       maturity_multiplier: r.model.maturity_multiplier,
+      chain_multiplier: r.model.chain_multiplier,
     })),
-    live,
+    live: liveRows,
   };
 
   return { board, radar };
